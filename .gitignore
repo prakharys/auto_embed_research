@@ -1,1 +1,27 @@
 autoresearch/
+
+# secrets
+garage/.env
+
+# python
+__pycache__/
+*.pyc
+*.pyo
+.Python
+
+# virtual env
+garage/.venv/
+
+# data — corpus PDFs, index cache, and results DB are large / local-only
+garage/data/corpus/
+garage/data/index_cache/
+garage/data/results.db
+
+# run logs and ephemeral outputs (large, regeneratable)
+garage/results/runs/
+garage/results/sprint1_200trials.log
+garage/results/live_scores.png
+garage/results/pareto_front.png
+
+# OS
+.DS_Store
