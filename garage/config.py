@@ -1,7 +1,12 @@
 """
-config.py — GARAGE Search Space Definition (FROZEN — never modified by agents)
+config.py — GARAGE Search Space Definition (Sprint 2)
 
-Defines all ~45 parameters and their Optuna search space.
+Defines ~25 parameters and their Optuna search space.
+Sprint 2 narrows the space based on Sprint 1 FAnova findings:
+  - Fixed: metric=ip, system_prompt_variant=variant_3
+  - Dropped: bm25_only, hybrid_cc, unstructured, cross_encoder_minilm,
+             html table extraction, numbered context format, IVF index, cosine/l2 metric
+
 Called by bo_agent.py to sample a config for each trial.
 
 Usage:
@@ -31,24 +36,25 @@ def sample(trial: optuna.Trial) -> dict:
 
     # ------------------------------------------------------------------
     # Component 1: Document Parsing
+    # Sprint 2: dropped "unstructured" (3× slower, 0.505 mean vs 0.599 pymupdf)
     # ------------------------------------------------------------------
-    # NOTE: "unstructured" uses strategy="fast" (no OCR) — safe to include.
-    # OCR hardcoded to False — FinanceBench PDFs are digital text, not scanned.
     cfg["parser"] = trial.suggest_categorical(
-        "parser", ["pymupdf", "pdfplumber", "unstructured"]
+        "parser", ["pymupdf", "pdfplumber"]
     )
+    # Sprint 2: dropped "html" (wastes context window, worst performer 0.526)
     cfg["table_extraction_strategy"] = trial.suggest_categorical(
-        "table_extraction_strategy", ["none", "text", "markdown", "html"]
+        "table_extraction_strategy", ["none", "text", "markdown"]
     )
     cfg["ocr_enabled"] = False  # hardcoded — digital PDFs only
 
     # ------------------------------------------------------------------
     # Component 2: Chunking
+    # Sprint 2: chunk_size floor raised to 256 (small chunks hurt dense retrieval)
     # ------------------------------------------------------------------
     cfg["chunk_strategy"] = trial.suggest_categorical(
         "chunk_strategy", ["fixed", "recursive", "semantic", "sentence", "paragraph"]
     )
-    cfg["chunk_size"] = trial.suggest_int("chunk_size", 128, 1024, step=64)
+    cfg["chunk_size"] = trial.suggest_int("chunk_size", 256, 1024, step=64)
     cfg["chunk_overlap"] = trial.suggest_int("chunk_overlap", 0, 192, step=16)
     cfg["metadata_injection"] = trial.suggest_categorical(
         "metadata_injection", [True, False]
@@ -61,8 +67,6 @@ def sample(trial: optuna.Trial) -> dict:
 
     # ------------------------------------------------------------------
     # Component 3: Embedding
-    # NOTE: query_prefix / passage_prefix removed — OpenAI text-embedding-3-*
-    # models were not trained with instruction prefixes; they add noise.
     # ------------------------------------------------------------------
     cfg["query_prefix"]   = "none"   # hardcoded — not a tunable for OpenAI embeddings
     cfg["passage_prefix"] = "none"   # hardcoded — not a tunable for OpenAI embeddings
@@ -75,13 +79,13 @@ def sample(trial: optuna.Trial) -> dict:
 
     # ------------------------------------------------------------------
     # Component 4: Indexing (FAISS)
+    # Sprint 2: metric fixed to "ip" (outperforms cosine by 0.075 mean)
+    #           IVF dropped (underperformed Flat/HNSW in sprint 1)
     # ------------------------------------------------------------------
     cfg["index_type"] = trial.suggest_categorical(
-        "index_type", ["Flat", "IVF", "HNSW"]
+        "index_type", ["Flat", "HNSW"]
     )
-    cfg["metric"] = trial.suggest_categorical(
-        "metric", ["cosine", "l2", "ip"]
-    )
+    cfg["metric"] = "ip"  # fixed — IP dominates (0.075 over cosine) despite L2-normalised embeds
 
     # Conditional: HNSW-only
     if cfg["index_type"] == "HNSW":
@@ -89,19 +93,17 @@ def sample(trial: optuna.Trial) -> dict:
     else:
         cfg["hnsw_m"] = None
 
-    # Conditional: IVF-only
-    if cfg["index_type"] == "IVF":
-        cfg["ivf_nlist"]  = trial.suggest_int("ivf_nlist", 64, 512, step=32)
-        cfg["ivf_nprobe"] = trial.suggest_int("ivf_nprobe", 8, 128, step=8)
-    else:
-        cfg["ivf_nlist"]  = None
-        cfg["ivf_nprobe"] = None
+    # IVF dropped — always None
+    cfg["ivf_nlist"]  = None
+    cfg["ivf_nprobe"] = None
 
     # ------------------------------------------------------------------
     # Component 5: Retrieval / Hybrid Search
+    # Sprint 2: bm25_only dropped (best 0.564, clearly inferior)
+    #           hybrid_cc dropped (worse than hybrid_rrf consistently)
     # ------------------------------------------------------------------
     cfg["retrieval_mode"] = trial.suggest_categorical(
-        "retrieval_mode", ["dense_only", "bm25_only", "hybrid_rrf", "hybrid_cc"]
+        "retrieval_mode", ["dense_only", "hybrid_rrf"]
     )
     cfg["dense_top_k"]  = trial.suggest_int("dense_top_k", 5, 50)
     cfg["bm25_top_k"]   = trial.suggest_int("bm25_top_k", 5, 50)
@@ -112,11 +114,8 @@ def sample(trial: optuna.Trial) -> dict:
     cfg["bm25_k1"] = trial.suggest_float("bm25_k1", 0.5, 2.5)
     cfg["bm25_b"]  = trial.suggest_float("bm25_b",  0.0, 1.0)
 
-    # Conditional: hybrid_cc only
-    if cfg["retrieval_mode"] == "hybrid_cc":
-        cfg["hybrid_alpha"] = trial.suggest_float("hybrid_alpha", 0.0, 1.0)
-    else:
-        cfg["hybrid_alpha"] = None
+    # hybrid_cc dropped — always None
+    cfg["hybrid_alpha"] = None
 
     # Conditional: hybrid_rrf only
     if cfg["retrieval_mode"] == "hybrid_rrf":
@@ -147,9 +146,10 @@ def sample(trial: optuna.Trial) -> dict:
 
     # ------------------------------------------------------------------
     # Component 7: Reranking
+    # Sprint 2: cross_encoder_minilm dropped (ceiling 0.572, mediocre)
     # ------------------------------------------------------------------
     cfg["reranker"] = trial.suggest_categorical(
-        "reranker", ["none", "cross_encoder_minilm", "cross_encoder_bge", "rankgpt"]
+        "reranker", ["none", "cross_encoder_bge", "rankgpt"]
     )
 
     # Conditional: only if reranker != none
@@ -166,6 +166,7 @@ def sample(trial: optuna.Trial) -> dict:
 
     # ------------------------------------------------------------------
     # Component 8: Context Assembly
+    # Sprint 2: "numbered" format dropped (worst performer, 0.088 below plain)
     # ------------------------------------------------------------------
     cfg["context_ordering"] = trial.suggest_categorical(
         "context_ordering",
@@ -184,16 +185,16 @@ def sample(trial: optuna.Trial) -> dict:
     cfg["max_context_tokens"] = trial.suggest_int(
         "max_context_tokens", 512, 8192, step=256
     )
+    # Sprint 2: "numbered" dropped (adds noise tokens, hurts attention)
     cfg["context_format"] = trial.suggest_categorical(
-        "context_format", ["plain", "numbered", "cited", "xml_tagged"]
+        "context_format", ["plain", "cited", "xml_tagged"]
     )
 
     # ------------------------------------------------------------------
     # Component 9: Answer Generation
+    # Sprint 2: system_prompt_variant fixed to variant_3 (13% variance, best mean)
     # ------------------------------------------------------------------
-    cfg["system_prompt_variant"] = trial.suggest_categorical(
-        "system_prompt_variant", ["variant_1", "variant_2", "variant_3"]
-    )
+    cfg["system_prompt_variant"] = "variant_3"  # fixed — 13% variance driver, clear winner
     cfg["temperature"]      = trial.suggest_float("temperature", 0.0, 0.7)
     cfg["max_tokens"]       = trial.suggest_int("max_tokens", 256, 2048, step=128)
     cfg["context_in_system"] = trial.suggest_categorical(
@@ -211,14 +212,14 @@ def sample(trial: optuna.Trial) -> dict:
 
 def default_config() -> dict:
     """
-    Return a sensible baseline config (no Optuna trial needed).
-    Useful for code agent baseline runs and smoke tests.
+    Return the best-known config from sprint 1 as baseline.
+    Based on Trial 080 (score=0.7629, latency=11.0s).
     """
     return {
         # Parsing
         "parser":                    "pymupdf",
         "table_extraction_strategy": "text",
-        "ocr_enabled":               False,              # not tunable — digital PDFs only
+        "ocr_enabled":               False,
         # Chunking
         "chunk_strategy":            "recursive",
         "chunk_size":                512,
@@ -227,28 +228,28 @@ def default_config() -> dict:
         "metadata_injection":        False,
         "contextual_compression":    False,
         # Embedding
-        "query_prefix":              "none",              # not tunable with OpenAI embeddings
-        "passage_prefix":            "none",              # not tunable with OpenAI embeddings
-        "embedding_model":           "text-embedding-3-small",
+        "query_prefix":              "none",
+        "passage_prefix":            "none",
+        "embedding_model":           "text-embedding-3-large",
         "embedding_batch_size":      128,
         # Indexing
         "index_type":                "Flat",
-        "metric":                    "cosine",
+        "metric":                    "ip",
         "hnsw_m":                    None,
         "ivf_nlist":                 None,
         "ivf_nprobe":                None,
         # Retrieval
         "retrieval_mode":            "hybrid_rrf",
-        "dense_top_k":               20,
-        "bm25_top_k":                20,
-        "final_top_k":               10,
+        "dense_top_k":               23,
+        "bm25_top_k":                9,
+        "final_top_k":               11,
         "bm25_tokenizer":            "whitespace",
         "bm25_k1":                   1.5,
         "bm25_b":                    0.75,
         "hybrid_alpha":              None,
         "rrf_k":                     60,
         # Query
-        "query_strategy":            "verbatim",
+        "query_strategy":            "decompose",
         "hyde_model":                None,
         "multi_query_n":             None,
         # Reranking
@@ -257,18 +258,18 @@ def default_config() -> dict:
         "rerank_top_k_output":       None,
         "rerank_score_threshold":    None,
         # Context assembly
-        "context_ordering":          "score_desc",
+        "context_ordering":          "reverse_middle",
         "deduplication":             False,
         "dedup_threshold":           None,
-        "max_context_tokens":        2048,
-        "context_format":            "numbered",
+        "max_context_tokens":        7680,
+        "context_format":            "plain",
         # Answer generation
-        "system_prompt_variant":     "variant_1",
-        "temperature":               0.0,
+        "system_prompt_variant":     "variant_3",
+        "temperature":               0.67,
         "max_tokens":                512,
         "context_in_system":         False,
-        "cot_enabled":               False,
-        "answer_format":             "freeform",
+        "cot_enabled":               True,
+        "answer_format":             "structured",
     }
 
 
@@ -283,6 +284,6 @@ if __name__ == "__main__":
     print(f"Sampled {len(cfg)} parameters:")
     for k, v in cfg.items():
         print(f"  {k}: {v}")
-    print("\nDefault config:")
+    print("\nDefault config (sprint 1 best):")
     d = default_config()
     print(f"  {len(d)} parameters")
