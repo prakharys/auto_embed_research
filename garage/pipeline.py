@@ -550,8 +550,9 @@ def build_index(chunks: list[Chunk], config: dict,
     import pickle
 
     cfg_hash = _config_hash(config)
+    emb_hash = _embedding_hash(config)
 
-    # --- try loading from disk cache ---
+    # --- Level 1: full index disk cache (fastest path) ---
     if cache_dir is not None:
         cached = _load_index(cfg_hash, Path(cache_dir), config=config)
         if cached is not None:
@@ -566,9 +567,23 @@ def build_index(chunks: list[Chunk], config: dict,
     _log(f"index  building  n={len(chunks)} chunks  index={config.get('index_type','Flat')}  metric={config.get('metric','cosine')}")
     t0 = time.time()
 
-    embeddings = embed_texts(texts, config, is_query=False)
+    # --- Level 2: embedding disk cache (skip API calls, rebuild FAISS/BM25 only) ---
+    cached_embeddings, cached_chunks, cached_tokenized = None, None, None
+    if cache_dir is not None:
+        cached_embeddings, cached_chunks, cached_tokenized = _load_embeddings(emb_hash, Path(cache_dir))
+
+    if cached_embeddings is not None:
+        embeddings = cached_embeddings
+        chunks = cached_chunks
+        tokenized = cached_tokenized
+        _log(f"embed  reused  hash={emb_hash}")
+    else:
+        embeddings = embed_texts(texts, config, is_query=False)
+        tokenized = tokenize_for_bm25(texts, config)
+        if cache_dir is not None:
+            _save_embeddings(emb_hash, embeddings, chunks, tokenized, Path(cache_dir))
+
     faiss_index = build_faiss_index(embeddings.copy(), config)
-    tokenized = tokenize_for_bm25(texts, config)
     bm25 = build_bm25(tokenized, config)
 
     _log(f"index  done  hash={cfg_hash}  {time.time()-t0:.1f}s")
@@ -581,11 +596,36 @@ def build_index(chunks: list[Chunk], config: dict,
         config_hash=cfg_hash,
     )
 
-    # --- save to disk cache ---
+    # --- save full index cache ---
     if cache_dir is not None:
         _save_index(index, Path(cache_dir))
 
     return index
+
+
+def _save_embeddings(emb_hash: str, embeddings: np.ndarray,
+                     chunks: list, tokenized: list, cache_dir: Path) -> None:
+    """Persist embeddings + chunks to cache_dir/emb_{emb_hash}/ (no FAISS index)."""
+    import pickle
+    slot = cache_dir / f"emb_{emb_hash}"
+    slot.mkdir(parents=True, exist_ok=True)
+    np.save(str(slot / "embeddings.npy"), embeddings)
+    with open(slot / "chunks_tokenized.pkl", "wb") as f:
+        pickle.dump((chunks, tokenized), f)
+    _log(f"embed  saved → {slot}")
+
+
+def _load_embeddings(emb_hash: str, cache_dir: Path):
+    """Load embeddings + chunks from cache_dir/emb_{emb_hash}/ if present."""
+    import pickle
+    slot = cache_dir / f"emb_{emb_hash}"
+    if not (slot / "embeddings.npy").exists() or not (slot / "chunks_tokenized.pkl").exists():
+        return None, None, None
+    _log(f"embed  cache hit  hash={emb_hash}  loading from {slot}")
+    embeddings = np.load(str(slot / "embeddings.npy"))
+    with open(slot / "chunks_tokenized.pkl", "rb") as f:
+        chunks, tokenized = pickle.load(f)
+    return embeddings, chunks, tokenized
 
 
 def _save_index(index: RAGIndex, cache_dir: Path) -> None:
@@ -640,28 +680,41 @@ def _load_index(config_hash: str, cache_dir: Path,
     )
 
 
-# Parameters that affect the content of the index (embeddings, FAISS, tokenized chunks).
-# bm25_k1, bm25_b, retrieval_mode, query_strategy, reranker, answer-gen params etc.
-# do NOT affect the stored index — exclude them so the disk cache gets reused.
-_INDEX_KEYS = frozenset({
+# Keys that affect the actual embedding vectors and chunk content.
+# Changing any of these requires re-embedding from scratch.
+_EMBEDDING_KEYS = frozenset({
     # Parsing
     "parser", "table_extraction_strategy", "ocr_enabled",
     # Chunking
     "chunk_strategy", "chunk_size", "chunk_overlap",
     "metadata_injection", "contextual_compression",
-    # Embedding
+    # Embedding model
     "embedding_model", "embedding_batch_size",
     "query_prefix", "passage_prefix",
-    # FAISS
+})
+
+# Keys that additionally affect the FAISS index or BM25 tokenisation.
+# Changing these reuses embeddings but rebuilds the index structure (fast).
+_INDEX_KEYS = _EMBEDDING_KEYS | frozenset({
     "index_type", "metric", "hnsw_m", "ivf_nlist", "ivf_nprobe",
-    # BM25 tokenisation (affects tokenized_chunks content, not just scoring)
     "bm25_tokenizer",
 })
+
+
+def _embedding_hash(config: dict) -> str:
+    keys = sorted((k, v) for k, v in config.items() if k in _EMBEDDING_KEYS)
+    return hashlib.md5(str(keys).encode()).hexdigest()[:8]
 
 
 def _config_hash(config: dict) -> str:
     keys = sorted((k, v) for k, v in config.items() if k in _INDEX_KEYS)
     return hashlib.md5(str(keys).encode()).hexdigest()[:8]
+
+
+def index_cached(config: dict, cache_dir: Path) -> bool:
+    """Return True if the full index for this config is already on disk."""
+    slot = Path(cache_dir) / _config_hash(config)
+    return all((slot / f).exists() for f in ("embeddings.npy", "faiss.index", "chunks_tokenized.pkl"))
 
 
 # ---------------------------------------------------------------------------

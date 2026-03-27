@@ -39,7 +39,8 @@ RESULTS_DIR.mkdir(exist_ok=True)
 
 STORAGE      = f"sqlite:///{DATA_DIR / 'results.db'}"
 SAVE_PATH    = RESULTS_DIR / "live_scores.png"
-BASELINE     = 0.4996   # sprint1 baseline composite_score
+BASELINE     = 0.7629   # sprint 1 best — new floor for sprint 2
+LATENCY_XLIM = 25_000   # ms — clip pareto x-axis at 25 s
 
 
 # ---------------------------------------------------------------------------
@@ -78,7 +79,7 @@ def load_trials(study_name: str):
     try:
         study = optuna.load_study(study_name=study_name, storage=STORAGE)
     except Exception:
-        return [], []
+        return [], [], None
 
     complete = [
         t for t in study.trials
@@ -88,7 +89,7 @@ def load_trials(study_name: str):
         t for t in study.trials
         if t.state == optuna.trial.TrialState.PRUNED
     ]
-    return complete, pruned
+    return complete, pruned, study
 
 
 # ---------------------------------------------------------------------------
@@ -98,7 +99,7 @@ def load_trials(study_name: str):
 def draw(fig, axes, study_name: str):
     ax_prog, ax_pareto, ax_dims = axes
 
-    complete, pruned = load_trials(study_name)
+    complete, pruned, study = load_trials(study_name)
 
     for ax in axes:
         ax.cla()
@@ -112,7 +113,7 @@ def draw(fig, axes, study_name: str):
     # Panel 1 — Score progression
     # ------------------------------------------------------------------ #
     ax_prog.set_title(
-        f"Score Progression  |  {n_complete} complete  {n_pruned} pruned  / 200",
+        f"Score Progression  |  {n_complete} complete  {n_pruned} pruned  / 100",
         fontsize=10, pad=6,
     )
     ax_prog.set_xlabel("Trial #", fontsize=9)
@@ -133,13 +134,13 @@ def draw(fig, axes, study_name: str):
 
         ax_prog.scatter(nums, scores, c=ACCENT, s=30, alpha=0.65,
                         edgecolors="none", zorder=3, label="Trial score")
-        ax_prog.plot(nums, best_so_far, color=GREEN, linewidth=1.8,
-                     zorder=4, label=f"Best: {max(scores):.4f}")
-
-        # annotate best point
         best_idx = int(np.argmax(scores))
+        best_score = scores[best_idx]
+        ax_prog.plot(nums, best_so_far, color=GREEN, linewidth=1.8,
+                     zorder=4, label=f"Best: {best_score:.4f}")
+
         ax_prog.annotate(
-            f"  {max(scores):.4f}",
+            f"  {best_score:.4f}",
             xy=(nums[best_idx], scores[best_idx]),
             color=GREEN, fontsize=8, va="bottom",
         )
@@ -161,10 +162,9 @@ def draw(fig, axes, study_name: str):
         latencies = [t.values[1] for t in complete]
 
         try:
-            study      = optuna.load_study(study_name=study_name, storage=STORAGE)
-            pareto     = study.best_trials
-            p_scores   = [t.values[0] for t in pareto]
-            p_lats     = [t.values[1] for t in pareto]
+            pareto   = study.best_trials
+            p_scores = [t.values[0] for t in pareto]
+            p_lats   = [t.values[1] for t in pareto]
         except Exception:
             pareto, p_scores, p_lats = [], [], []
 
@@ -178,6 +178,8 @@ def draw(fig, axes, study_name: str):
             ax_pareto.plot([x for x, _ in paired], [y for _, y in paired],
                            color=GREEN, linewidth=1.2, linestyle="--", alpha=0.6)
 
+        ax_pareto.set_xlim(0, LATENCY_XLIM)
+
     ax_pareto.legend(fontsize=8, facecolor=AX_BG, edgecolor=GRID, labelcolor=TEXT)
 
     # ------------------------------------------------------------------ #
@@ -188,13 +190,10 @@ def draw(fig, axes, study_name: str):
 
     if complete:
         dims = {
-            "embedding_model": {
-                "text-embedding-3-small": "small",
-                "text-embedding-3-large": "large",
-            },
-            "chunk_strategy": None,
             "retrieval_mode": None,
-            "reranker": None,
+            "chunk_strategy": None,
+            "reranker":       None,
+            "query_strategy": None,
         }
 
         groups = {}
@@ -270,7 +269,7 @@ def draw(fig, axes, study_name: str):
 
 def main():
     ap = argparse.ArgumentParser(description="GARAGE live score dashboard")
-    ap.add_argument("--study",     default="garage_financebench")
+    ap.add_argument("--study",     default="garage_financebench_s2")
     ap.add_argument("--interval",  type=int, default=30,
                     help="Refresh interval in seconds (default: 30)")
     ap.add_argument("--no-window", action="store_true",

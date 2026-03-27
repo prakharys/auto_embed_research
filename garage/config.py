@@ -60,7 +60,7 @@ def sample(trial: optuna.Trial) -> dict:
     cfg["chunk_strategy"] = trial.suggest_categorical(
         "chunk_strategy", ["fixed", "recursive", "semantic", "sentence", "paragraph"]
     )
-    cfg["chunk_size"] = trial.suggest_int("chunk_size", 256, 1024, step=64)
+    cfg["chunk_size"] = trial.suggest_int("chunk_size", 512, 1024, step=64)
     cfg["chunk_overlap"] = trial.suggest_int("chunk_overlap", 0, 192, step=16)
     cfg["metadata_injection"] = False          # fixed — <3% importance, sprint 1 best used False
     cfg["contextual_compression"] = False      # fixed — 3× slower, no consistent gain
@@ -239,19 +239,10 @@ if __name__ == "__main__":
     trial = study.ask()
     cfg = sample(trial)
 
-    tunable = [k for k, v in cfg.items()
-               if k not in ("chunk_overlap_pct",)  # derived
-               and v is not None
-               and not isinstance(v, bool)]
-    fixed = [k for k, v in cfg.items()
-             if isinstance(v, (bool, str, int, float))
-             and k + "_" not in ("chunk_overlap_pct_",)]
-
     print(f"Sampled config ({len(cfg)} total fields):")
     for k, v in cfg.items():
         print(f"  {k}: {v}")
 
-    # Count active tunables (Optuna params actually sampled this trial)
     print(f"\nOptuna params sampled this trial: {len(trial.params)}")
     print("Default config (sprint 1 best):")
     d = default_config()

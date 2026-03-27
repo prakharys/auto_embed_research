@@ -52,7 +52,7 @@ import optuna
 from optuna.samplers import NSGAIISampler
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 
-from pipeline import Document, parse_documents, chunk_documents, build_index, run, PipelineOutput, RAGIndex
+from pipeline import Document, parse_documents, chunk_documents, build_index, run, PipelineOutput, RAGIndex, index_cached, _config_hash as _pipeline_config_hash
 from config import sample as sample_config, default_config
 from eval import evaluate
 from logger import RunLogger
@@ -67,6 +67,8 @@ CORPUS_DIR      = DATA_DIR / "corpus"
 GTS_PATH        = DATA_DIR / "gts.jsonl"
 INDEX_CACHE_DIR = DATA_DIR / "index_cache"
 INDEX_CACHE_DIR.mkdir(exist_ok=True)
+PARSE_CACHE_DIR = DATA_DIR / "parse_cache"
+PARSE_CACHE_DIR.mkdir(exist_ok=True)
 RESULTS_DIR     = GARAGE_DIR / "results"
 RESULTS_DIR.mkdir(exist_ok=True)
 
@@ -84,10 +86,41 @@ _parse_cache: dict[tuple, list] = {}
 _index_cache: dict[str, RAGIndex] = {}
 
 
+def _parse_cache_path(parse_key: tuple) -> Path:
+    name = f"{parse_key[0]}_tables-{parse_key[1]}_ocr-{parse_key[2]}.pkl"
+    return PARSE_CACHE_DIR / name
+
+
+def _load_parse_cache(parse_key: tuple) -> list | None:
+    import pickle
+    path = _parse_cache_path(parse_key)
+    if path.exists():
+        return pickle.loads(path.read_bytes())
+    return None
+
+
+def _save_parse_cache(parse_key: tuple, docs: list) -> None:
+    import pickle
+    _parse_cache_path(parse_key).write_bytes(pickle.dumps(docs))
+
+
 def get_or_build_index(config: dict) -> RAGIndex:
+    # Fast path 1: in-memory cache (check before any filesystem work)
+    cfg_hash = _pipeline_config_hash(config)
+    if cfg_hash in _index_cache:
+        print(f"  [index] reused hash={cfg_hash}")
+        return _index_cache[cfg_hash]
+
+    # Fast path 2: disk cache present — skip parse + chunk entirely
+    if index_cached(config, INDEX_CACHE_DIR):
+        index = build_index([], config, cache_dir=INDEX_CACHE_DIR)
+        _index_cache[cfg_hash] = index
+        print(f"  [index] disk hit  hash={cfg_hash}  chunks={len(index.chunks)}")
+        return _index_cache[cfg_hash]
+
+    # Cache miss — parse, chunk, embed, build
     txt_files = list(CORPUS_DIR.glob("*.txt"))
     pdf_files = sorted(CORPUS_DIR.glob("*.pdf"))
-
     if not txt_files and not pdf_files:
         sys.exit(f"ERROR: No documents in {CORPUS_DIR}. Run setup_financebench.py first.")
 
@@ -99,21 +132,22 @@ def get_or_build_index(config: dict) -> RAGIndex:
                  config.get("table_extraction_strategy", "none"),
                  config.get("ocr_enabled", False))
     if parse_key not in _parse_cache:
-        print(f"  [parse] {len(pdf_files)} PDFs  parser={parse_key[0]}  tables={parse_key[1]}")
-        _parse_cache[parse_key] = parse_documents(pdf_files, config)
-        print(f"  [parse] done → {len(_parse_cache[parse_key])} docs")
+        cached_docs = _load_parse_cache(parse_key)
+        if cached_docs is not None:
+            print(f"  [parse] disk hit  parser={parse_key[0]}  tables={parse_key[1]}")
+            _parse_cache[parse_key] = cached_docs
+        else:
+            print(f"  [parse] {len(pdf_files)} PDFs  parser={parse_key[0]}  tables={parse_key[1]}")
+            _parse_cache[parse_key] = parse_documents(pdf_files, config)
+            _save_parse_cache(parse_key, _parse_cache[parse_key])
+            print(f"  [parse] done → {len(_parse_cache[parse_key])} docs")
     docs.extend(_parse_cache[parse_key])
 
     chunks = chunk_documents(docs, config)
     index  = build_index(chunks, config, cache_dir=INDEX_CACHE_DIR)
-
-    if index.config_hash not in _index_cache:
-        _index_cache[index.config_hash] = index
-        print(f"  [index] built  hash={index.config_hash}  chunks={len(chunks)}")
-    else:
-        print(f"  [index] reused hash={index.config_hash}")
-
-    return _index_cache[index.config_hash]
+    _index_cache[cfg_hash] = index
+    print(f"  [index] built  hash={cfg_hash}  chunks={len(chunks)}")
+    return _index_cache[cfg_hash]
 
 
 # ---------------------------------------------------------------------------
@@ -149,11 +183,13 @@ def run_baseline(study_name: str) -> float:
 # ---------------------------------------------------------------------------
 
 _baseline_cfg: dict | None = None
+_best_score: float = 0.0
 
 
 def run_bo(study_name: str, n_trials: int) -> optuna.Study:
-    global _baseline_cfg
+    global _baseline_cfg, _best_score
     _baseline_cfg = default_config()
+    _best_score = 0.0
 
     print("\n" + "=" * 60)
     print(f"  STAGE 2 — BO ({n_trials} trials, study='{study_name}')")
@@ -180,6 +216,7 @@ def run_bo(study_name: str, n_trials: int) -> optuna.Study:
     pbar = tqdm(total=remaining, desc="  BO trials", unit="trial")
 
     def objective(trial: optuna.Trial):
+        global _best_score
         cfg = sample_config(trial)
         tag = f"{study_name}_trial_{trial.number:04d}"
         log = RunLogger(tag=tag)
@@ -213,11 +250,10 @@ def run_bo(study_name: str, n_trials: int) -> optuna.Study:
         log.finish(result, config=cfg, baseline_config=_baseline_cfg,
                    notes=f"sprint2 bo trial {trial.number}")
 
-        finished = [t for t in study.trials if t.state.is_finished() and t.values]
-        best = max((t.values[0] for t in finished), default=0.0)
+        _best_score = max(_best_score, result.composite_score)
         tqdm.write(f"  → score={result.composite_score:.4f}  lat={result.latency_ms:.0f}ms  "
-                   f"best={best:.4f}  s1_best={S1_BEST:.4f}")
-        pbar.set_postfix({"score": f"{result.composite_score:.4f}", "best": f"{best:.4f}"})
+                   f"best={_best_score:.4f}  s1_best={S1_BEST:.4f}")
+        pbar.set_postfix({"score": f"{result.composite_score:.4f}", "best": f"{_best_score:.4f}"})
         pbar.update(1)
 
         return result.composite_score, result.latency_ms

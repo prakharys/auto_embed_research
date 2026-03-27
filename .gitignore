@@ -20,8 +20,11 @@ garage/data/results.db
 # run logs and ephemeral outputs (large, regeneratable)
 garage/results/runs/
 garage/results/sprint1_200trials.log
+garage/results/sprint2_100trials.log
 garage/results/live_scores.png
 garage/results/pareto_front.png
+garage/results/pareto_front_s2.png
+garage/data/parse_cache/
 
 # OS
 .DS_Store
